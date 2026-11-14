@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ビンゴ ロール</title>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1530; --panel: #1a2248; --panel2: #232c5a; --text: #eef1ff; --muted: #9aa3cf;
+    --accent: #ffcc33; --reach: #ff9f1c; --bingo: #ff3d6e; --ok: #3ddc97;
+    --B: #3a86ff; --I: #ff006e; --N: #8338ec; --G: #06d6a0; --O: #fb8500;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", system-ui, sans-serif;
+         background: var(--bg); color: var(--text); min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 20px; background: var(--panel); }
+  header h1 { margin: 0; font-size: 22px; letter-spacing: .1em; }
+  .code-box { display: flex; align-items: center; gap: 10px; background: var(--panel2); padding: 6px 14px; border-radius: 10px; }
+  .code-box .label { font-size: 12px; color: var(--muted); }
+  .code-box .code { font-size: 30px; font-weight: 800; letter-spacing: .2em; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .conn { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #888; display: inline-block; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.wait { background: var(--reach); }
+  .spacer { flex: 1; }
+  button { font: inherit; cursor: pointer; border: none; border-radius: 8px; padding: 8px 14px; background: var(--panel2); color: var(--text); }
+  button:hover { filter: brightness(1.2); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .toggle.on { background: #3a4a9a; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, .75fr); gap: 20px; padding: 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section.panel { background: var(--panel); border-radius: 16px; padding: 18px; }
+  h2 { margin: 0 0 12px; font-size: 16px; color: var(--muted); font-weight: 600; }
+
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 10px 0 4px; }
+  .ball { width: min(300px, 62vw); aspect-ratio: 1; border-radius: 50%; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; background: radial-gradient(circle at 32% 28%, #fff 0 8%, var(--ballc, #555) 45%, #000a 100%);
+          box-shadow: 0 18px 50px #0008; }
+  .ball .inner { width: 62%; aspect-ratio: 1; border-radius: 50%; background: #fff; color: #111; display: flex; flex-direction: column;
+                 align-items: center; justify-content: center; }
+  .ball .letter { font-size: clamp(18px, 4vw, 34px); font-weight: 800; line-height: 1; color: var(--ballc, #555); }
+  .ball .num { font-size: clamp(56px, 13vw, 112px); font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
+  .ball.spin .inner { animation: wob .12s infinite alternate; }
+  .ball.pop { animation: pop .5s ease-out; }
+  @keyframes wob { from { transform: rotate(-4deg); } to { transform: rotate(4deg); } }
+  @keyframes pop { 0% { transform: scale(.7); } 60% { transform: scale(1.08); } 100% { transform: scale(1); } }
+  .roll-btn { font-size: 28px; font-weight: 800; letter-spacing: .2em; padding: 16px 60px; border-radius: 999px;
+              background: linear-gradient(180deg, #ffd84d, #ffb300); color: #3a2600; box-shadow: 0 6px 0 #b37b00; }
+  .roll-btn:active:not(:disabled) { transform: translateY(4px); box-shadow: 0 2px 0 #b37b00; }
+  .stage-sub { color: var(--muted); font-size: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  .recent { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; min-height: 40px; }
+  .chip { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+          font-weight: 800; color: #fff; font-size: 15px; }
+
+  .board { display: grid; grid-template-columns: 36px repeat(15, 1fr); gap: 4px; margin-top: 16px; }
+  .board .hd { font-weight: 900; display: flex; align-items: center; justify-content: center; border-radius: 6px; color: #fff; }
+  .board .cell { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; border-radius: 6px; background: #ffffff10;
+                 color: #ffffff40; font-weight: 700; font-size: clamp(10px, 1.4vw, 16px); font-variant-numeric: tabular-nums; }
+  .board .cell.hit { color: #fff; }
+  .board .cell.last { outline: 3px solid var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { outline-color: transparent; } }
+
+  .players { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow: auto; }
+  .player { display: flex; align-items: center; gap: 10px; background: var(--panel2); border-radius: 10px; padding: 10px 12px; }
+  .player .name { flex: 1; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .player .sub { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .badge { font-size: 12px; font-weight: 800; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+  .badge.reach { background: var(--reach); color: #2b1500; }
+  .badge.bingo { background: var(--bingo); color: #fff; }
+  .badge.none { background: #ffffff14; color: var(--muted); }
+  .player.is-bingo { box-shadow: inset 4px 0 0 var(--bingo); }
+  .player.is-reach { box-shadow: inset 4px 0 0 var(--reach); }
+  .summary { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .summary div { background: var(--panel2); border-radius: 10px; padding: 8px 12px; font-size: 13px; color: var(--muted); }
+  .summary b { font-size: 20px; color: var(--text); margin-left: 4px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 12px 0; }
+
+  .join-info { margin-top: 16px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  #qr { background: #fff; padding: 8px; border-radius: 8px; line-height: 0; }
+  #qr:empty { display: none; }
+  .join-info a { color: var(--accent); word-break: break-all; font-size: 13px; }
+
+  .toasts { position: fixed; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 10px; z-index: 50; max-width: min(380px, 90vw); }
+  .toast { padding: 14px 18px; border-radius: 12px; font-weight: 800; font-size: 18px; box-shadow: 0 10px 30px #0008;
+           animation: slide .35s ease-out; }
+  .toast.reach { background: var(--reach); color: #2b1500; }
+  .toast.bingo { background: var(--bingo); color: #fff; }
+  .toast.info { background: var(--panel2); color: var(--text); font-size: 14px; font-weight: 600; }
+  @keyframes slide { from { transform: translateX(120%); opacity: 0; } }
+
+  .overlay { position: fixed; inset: 0; background: #000a; display: none; align-items: center; justify-content: center; z-index: 60; }
+  .overlay.show { display: flex; }
+  .overlay .box { background: linear-gradient(160deg, #ff3d6e, #ff8a3d); padding: 36px 48px; border-radius: 24px; text-align: center;
+                  animation: pop .6s ease-out; max-width: 90vw; }
+  .overlay .big { font-size: clamp(48px, 10vw, 96px); font-weight: 900; letter-spacing: .1em; }
+  .overlay .who { font-size: clamp(22px, 4vw, 36px); font-weight: 800; margin-top: 8px; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BINGO</h1>
+  <div class="code-box">
+    <div class="label">認証番号</div>
+    <div class="code" id="code">------</div>
+  </div>
+  <div class="conn"><span class="dot" id="connDot"></span><span id="connText">接続中…</span></div>
+  <div class="spacer"></div>
+  <button class="toggle on" id="soundBtn">🔔 音</button>
+  <button class="toggle" id="speechBtn">🗣 読み上げ</button>
+  <button id="undoBtn">↩ 1つ戻す</button>
+  <button id="newGameBtn">新しいゲーム</button>
+  <button id="newCodeBtn">認証番号を変更</button>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="stage">
+      <div class="ball" id="ball"><div class="inner"><div class="letter" id="ballLetter">&nbsp;</div><div class="num" id="ballNum">--</div></div></div>
+      <button class="roll-btn" id="rollBtn">ROLL</button>
+      <div class="stage-sub"><span id="countText">0 / 75</span><span>直近:</span></div>
+      <div class="recent" id="recent"></div>
+    </div>
+    <div class="board" id="board"></div>
+  </section>
+
+  <section class="panel">
+    <h2>参加者</h2>
+    <div class="summary">
+      <div>参加<b id="sumAll">0</b></div>
+      <div>リーチ<b id="sumReach">0</b></div>
+      <div>ビンゴ<b id="sumBingo">0</b></div>
+    </div>
+    <div class="players" id="players"></div>
+    <div class="join-info" id="joinInfo"></div>
+  </section>
+</main>
+
+<div class="toasts" id="toasts"></div>
+<div class="overlay" id="overlay"><div class="box"><div class="big">BINGO!</div><div class="who" id="overlayWho"></div></div></div>
+
+<script>
+/* ===================== 設定 ===================== */
+// カードページを公開したURL（例: https://yourname.github.io/bingo-card/ ）
+// 設定すると、参加用のリンクとQRコードが表示されます。空なら非表示。
+const CARD_PAGE_URL = '';
+// ロール側とカード側で必ず同じ値にしてください
+const APP_NS = 'bingo-web-v1-x7q2m';
+const BROKER_URL = new URLSearchParams(location.search).get('broker') || 'wss://broker.emqx.io:8084/mqtt';
+/* ================================================ */
+
+const LETTERS = ['B', 'I', 'N', 'G', 'O'];
+const COLORS = { B: '#3a86ff', I: '#ff006e', N: '#8338ec', G: '#06d6a0', O: '#fb8500' };
+const LINES = (() => {
+  const L = [];
+  for (let i = 0; i < 5; i++) {
+    L.push([0, 1, 2, 3, 4].map(j => i * 5 + j));
+    L.push([0, 1, 2, 3, 4].map(j => j * 5 + i));
+  }
+  L.push([0, 6, 12, 18, 24], [4, 8, 12, 16, 20]);
+  return L;
+})();
+const letterOf = n => LETTERS[Math.floor((n - 1) / 15)];
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const rid = (n = 10) => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => 'abcdefghijkmnpqrstuvwxyz23456789'[b % 32]).join('');
+const newCode = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
+
+/* ---------- 状態 ---------- */
+const STORE_KEY = 'bingoRollState';
+let S = load() || freshState(newCode());
+let soundOn = true, speechOn = false, rolling = false;
+
+function freshState(code) { return { code, gameId: rid(), drawn: [], players: {} }; }
+function load() { try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch { return null; } }
+function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch {} }
+const topic = (kind, code = S.code) => `${APP_NS}/${code}/${kind}`;
+
+/* ---------- 判定 ---------- */
+function validCard(nums) {
+  if (!Array.isArray(nums) || nums.length !== 25) return false;
+  const seen = new Set();
+  for (let i = 0; i < 25; i++) {
+    const n = nums[i], c = i % 5;
+    if (i === 12) { if (n !== 0) return false; continue; }
+    if (!Number.isInteger(n) || n < c * 15 + 1 || n > c * 15 + 15 || seen.has(n)) return false;
+    seen.add(n);
+  }
+  return true;
+}
+function evaluate(nums, drawnSet) {
+  if (!nums) return { reach: 0, bingo: 0, hits: 0 };
+  const marked = nums.map((n, i) => i === 12 || drawnSet.has(n));
+  let reach = 0, bingo = 0;
+  for (const line of LINES) {
+    const c = line.filter(i => marked[i]).length;
+    if (c === 5) bingo++; else if (c === 4) reach++;
+  }
+  return { reach, bingo, hits: marked.filter(Boolean).length - 1 };
+}
+
+// 全員を再計算。notify=true なら状態が上がった人を通知
+function recompute(notify) {
+  const set = new Set(S.drawn);
+  const events = [];
+  for (const p of Object.values(S.players)) {
+    const prev = { reach: p.reach || 0, bingo: p.bingo || 0 };
+    const r = evaluate(p.nums, set);
+    Object.assign(p, r);
+    if (r.bingo > 0 && !p.bingoAt) {
+      p.bingoAt = S.drawn.length;
+      p.bingoRank = Object.values(S.players).filter(q => q.bingoAt).length;
+      if (notify) events.push({ type: 'bingo', p });
+    } else if (r.bingo === 0 && p.bingoAt) {
+      p.bingoAt = null; p.bingoRank = null; // 戻した場合
+    } else if (notify && r.bingo === 0 && r.reach > prev.reach) {
+      events.push({ type: 'reach', p });
+    }
+  }
+  return events;
+}
+
+/* ---------- MQTT ---------- */
+let client = null;
+function connect() {
+  setConn('wait', 'サーバーに接続中…');
+  client = mqtt.connect(BROKER_URL, {
+    clientId: 'roll_' + rid(12), clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 10000,
+  });
+  client.on('connect', () => {
+    setConn('on', '接続済み');
+    client.subscribe(topic('card'), { qos: 1 });
+    publishState();
+    rollcall();
+  });
+  client.on('reconnect', () => setConn('wait', '再接続中…'));
+  client.on('offline', () => setConn('', 'オフライン'));
+  client.on('error', e => { console.warn(e); setConn('', '接続エラー'); });
+  client.on('message', (t, payload) => {
+    if (t !== topic('card')) return;
+    let m; try { m = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
+    onCardMessage(m);
+  });
+}
+function publishState() {
+  if (!client || !client.connected) return;
+  client.publish(topic('state'), JSON.stringify({ v: 1, gameId: S.gameId, drawn: S.drawn, ts: Date.now() }), { qos: 1, retain: true });
+}
+function rollcall() {
+  if (client && client.connected) client.publish(topic('cmd'), JSON.stringify({ type: 'rollcall', gameId: S.gameId }), { qos: 0 });
+}
+function setConn(cls, text) { $('connDot').className = 'dot ' + cls; $('connText').textContent = text; }
+
+function onCardMessage(m) {
+  if (!m || typeof m.cardId !== 'string' || m.cardId.length > 40) return;
+  const id = m.cardId;
+  if (m.type === 'bye') {
+    if (S.players[id]) { S.players[id].online = false; save(); render(); }
+    return;
+  }
+  if (m.type !== 'hello' && m.type !== 'update') return;
+  const isNew = !S.players[id];
+  const p = S.players[id] || (S.players[id] = { joinedAt: Date.now() });
+  p.name = String(m.name || '名無し').slice(0, 20);
+  p.online = true;
+  p.lastSeen = Date.now();
+  // 現在のゲームのカードだけ受け付ける（カードの数字はロール側で検証して判定）
+  if (m.gameId === S.gameId && validCard(m.nums)) {
+    if (JSON.stringify(p.nums) !== JSON.stringify(m.nums)) { p.nums = m.nums; p.reach = 0; p.bingo = 0; p.bingoAt = null; p.bingoRank = null; }
+  }
+  if (isNew) toast('info', `${p.name} さんが参加しました`);
+  const events = recompute(true);
+  save(); render(); announce(events);
+}
+
+/* ---------- 操作 ---------- */
+function roll() {
+  if (rolling) return;
+  const remain = [];
+  for (let n = 1; n <= 75; n++) if (!S.drawn.includes(n)) remain.push(n);
+  if (!remain.length) return;
+  rolling = true; $('rollBtn').disabled = true;
+  const final = remain[crypto.getRandomValues(new Uint32Array(1))[0] % remain.length];
+  const ball = $('ball');
+  ball.classList.add('spin'); ball.classList.remove('pop');
+  let delay = 40, elapsed = 0;
+  const tick = () => {
+    showBall(remain[Math.floor(Math.random() * remain.length)]);
+    if (soundOn) beep(300 + Math.random() * 400, 0.03, 0.05);
+    elapsed += delay; delay *= 1.12;
+    if (elapsed < 1500) setTimeout(tick, delay);
+    else {
+      ball.classList.remove('spin'); void ball.offsetWidth; ball.classList.add('pop');
+      S.drawn.push(final);
+      showBall(final);
+      if (soundOn) chord([523, 659, 784], 0.25);
+      if (speechOn) speak(final);
+      publishState();
+      const events = recompute(true);
+      save(); render(); announce(events);
+      rolling = false; $('rollBtn').disabled = S.drawn.length >= 75;
+    }
+  };
+  tick();
+}
+function undo() {
+  if (rolling || !S.drawn.length) return;
+  const last = S.drawn[S.drawn.length - 1];
+  if (!confirm(`最後の数字 ${letterOf(last)}-${last} を取り消しますか？`)) return;
+  S.drawn.pop();
+  recompute(false);
+  publishState(); save(); render();
+  const prev = S.drawn[S.drawn.length - 1];
+  prev ? showBall(prev) : showBall(null);
+}
+function newGame() {
+  if (rolling) return;
+  if (!confirm('新しいゲームを始めますか？\n（出た数字はリセットされ、参加者のカードは新しく配り直されます）')) return;
+  S.gameId = rid(); S.drawn = [];
+  for (const p of Object.values(S.players)) { p.nums = null; p.reach = 0; p.bingo = 0; p.bingoAt = null; p.bingoRank = null; p.hits = 0; }
+  save(); publishState(); rollcall(); render(); showBall(null);
+  toast('info', '新しいゲームを開始しました');
+}
+function changeCode() {
+  if (rolling) return;
+  if (!confirm('認証番号を変更しますか？\n（参加者は新しい番号で接続し直す必要があります）')) return;
+  const old = S.code;
+  if (client && client.connected) {
+    client.publish(topic('state', old), '', { qos: 1, retain: true }); // 古い番号の保存データを削除
+    client.unsubscribe(topic('card', old));
+  }
+  S = freshState(newCode());
+  save(); render(); showBall(null);
+  if (client && client.connected) { client.subscribe(topic('card'), { qos: 1 }); publishState(); }
+}
+
+/* ---------- 通知 ---------- */
+function announce(events) {
+  const bingos = events.filter(e => e.type === 'bingo');
+  for (const e of events) {
+    if (e.type === 'reach') toast('reach', `🔥 ${e.p.name} さん リーチ！` + (e.p.reach > 1 ? `（${e.p.reach}本）` : ''));
+    else toast('bingo', `🎉 ${e.p.name} さん BINGO！（${e.p.bingoRank}位）`);
+  }
+  if (bingos.length) {
+    $('overlayWho').textContent = bingos.map(e => e.p.name + ' さん').join('、');
+    $('overlay').classList.add('show');
+    if (soundOn) fanfare();
+  } else if (events.length && soundOn) {
+    setTimeout(() => chord([784, 988], 0.2), 300);
+  }
+}
+function toast(kind, text) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind; el.textContent = text;
+  $('toasts').prepend(el);
+  setTimeout(() => el.remove(), kind === 'info' ? 3500 : 8000);
+}
+$('overlay').onclick = () => $('overlay').classList.remove('show');
+
+/* ---------- 音 ---------- */
+let ac;
+function audio() { ac = ac || new (window.AudioContext || window.webkitAudioContext)(); return ac; }
+function beep(freq, dur, vol = 0.15, when = 0) {
+  try {
+    const a = audio(), o = a.createOscillator(), g = a.createGain(), t = a.currentTime + when;
+    o.type = 'triangle'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(a.destination); o.start(t); o.stop(t + dur + 0.02);
+  } catch {}
+}
+function chord(fs, dur) { fs.forEach(f => beep(f, dur, 0.12)); }
+function fanfare() { [523, 659, 784, 1047, 784, 1047].forEach((f, i) => beep(f, 0.3, 0.15, i * 0.13)); }
+function speak(n) {
+  try {
+    const u = new SpeechSynthesisUtterance(`${letterOf(n)}の、${n}`);
+    u.lang = 'ja-JP'; speechSynthesis.cancel(); speechSynthesis.speak(u);
+  } catch {}
+}
+
+/* ---------- 描画 ---------- */
+function showBall(n) {
+  const L = n ? letterOf(n) : null;
+  $('ball').style.setProperty('--ballc', L ? COLORS[L] : '#555');
+  $('ballLetter').innerHTML = L || '&nbsp;';
+  $('ballNum').textContent = n || '--';
+}
+function buildBoard() {
+  const b = $('board'); b.innerHTML = '';
+  for (let r = 0; r < 5; r++) {
+    const h = document.createElement('div');
+    h.className = 'hd'; h.textContent = LETTERS[r]; h.style.background = COLORS[LETTERS[r]];
+    b.appendChild(h);
+    for (let k = 1; k <= 15; k++) {
+      const n = r * 15 + k, c = document.createElement('div');
+      c.className = 'cell'; c.id = 'c' + n; c.textContent = n;
+      b.appendChild(c);
+    }
+  }
+}
+function render() {
+  $('code').textContent = S.code;
+  const set = new Set(S.drawn), last = S.drawn[S.drawn.length - 1];
+  for (let n = 1; n <= 75; n++) {
+    const c = $('c' + n), hit = set.has(n);
+    c.classList.toggle('hit', hit); c.classList.toggle('last', n === last);
+    c.style.background = hit ? COLORS[letterOf(n)] : '';
+  }
+  $('countText').textContent = `${S.drawn.length} / 75`;
+  $('recent').innerHTML = S.drawn.slice(-8).reverse().map(n =>
+    `<div class="chip" style="background:${COLORS[letterOf(n)]}">${n}</div>`).join('');
+  $('rollBtn').disabled = rolling || S.drawn.length >= 75;
+  $('undoBtn').disabled = !S.drawn.length;
+
+  const ps = Object.values(S.players);
+  ps.sort((a, b) => (a.bingoRank || 999) - (b.bingoRank || 999) || (b.reach || 0) - (a.reach || 0) || (b.hits || 0) - (a.hits || 0) || a.joinedAt - b.joinedAt);
+  $('sumAll').textContent = ps.length;
+  $('sumReach').textContent = ps.filter(p => !p.bingo && p.reach).length;
+  $('sumBingo').textContent = ps.filter(p => p.bingo).length;
+  $('players').innerHTML = ps.length ? ps.map(p => {
+    let badge = '<span class="badge none">—</span>', cls = '';
+    if (!p.nums) badge = '<span class="badge none">カード待ち</span>';
+    else if (p.bingo) { badge = `<span class="badge bingo">BINGO ${p.bingoRank}位</span>`; cls = 'is-bingo'; }
+    else if (p.reach) { badge = `<span class="badge reach">リーチ${p.reach > 1 ? '×' + p.reach : ''}</span>`; cls = 'is-reach'; }
+    const sub = p.bingo ? `${p.bingoAt}球目でビンゴ` : p.nums ? `${p.hits || 0}個 当たり` : '';
+    return `<div class="player ${cls}"><span class="dot ${p.online ? 'on' : ''}"></span>
+      <div class="name">${esc(p.name)}<div class="sub">${sub}</div></div>${badge}</div>`;
+  }).join('') : '<div class="empty">まだ参加者がいません。カードページで認証番号を入力してもらいましょう。</div>';
+
+  const ji = $('joinInfo');
+  if (CARD_PAGE_URL) {
+    const url = CARD_PAGE_URL + (CARD_PAGE_URL.includes('?') ? '&' : '?') + 'code=' + S.code;
+    if (ji.dataset.url !== url) {
+      ji.dataset.url = url;
+      ji.innerHTML = `<div id="qr"></div><div><div style="color:var(--muted);font-size:13px">参加用リンク</div><a href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a></div>`;
+      try { new QRCode($('qr'), { text: url, width: 128, height: 128 }); } catch {}
+    }
+  }
+}
+
+/* ---------- 起動 ---------- */
+$('rollBtn').onclick = roll;
+$('undoBtn').onclick = undo;
+$('newGameBtn').onclick = newGame;
+$('newCodeBtn').onclick = changeCode;
+$('soundBtn').onclick = e => { soundOn = !soundOn; e.currentTarget.classList.toggle('on', soundOn); };
+$('speechBtn').onclick = e => { speechOn = !speechOn; e.currentTarget.classList.toggle('on', speechOn); };
+document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target === document.body) { e.preventDefault(); roll(); } });
+
+buildBoard();
+for (const p of Object.values(S.players)) p.online = false;
+save(); render();
+showBall(S.drawn[S.drawn.length - 1] || null);
+if (window.mqtt) connect(); else setConn('', 'ライブラリの読み込みに失敗しました');
+</script>
+</body>
+</html>
