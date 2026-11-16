@@ -170,7 +170,15 @@ const letterOf = n => LETTERS[Math.floor((n - 1) / 15)];
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const rid = (n = 10) => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => 'abcdefghijkmnpqrstuvwxyz23456789'[b % 32]).join('');
-const newCode = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
+// 最近この端末で使った番号は使わない（以前の参加者が紛れ込まないように）
+function newCode() {
+  let used = [];
+  try { used = JSON.parse(localStorage.getItem('bingoRollUsedCodes')) || []; } catch {}
+  let code;
+  do { code = String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000)); } while (used.includes(code));
+  try { localStorage.setItem('bingoRollUsedCodes', JSON.stringify([...used, code].slice(-200))); } catch {}
+  return code;
+}
 
 /* ---------- 状態 ---------- */
 const STORE_KEY = 'bingoRollState';
@@ -236,10 +244,11 @@ function connect() {
   client = mqtt.connect(BROKER_URL, {
     clientId: 'roll_' + rid(12), clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 10000,
   });
-  client.on('connect', () => {
+  client.on('connect', async () => {
     setConn('on', '接続済み');
     client.subscribe(topic('card'), { qos: 1 });
     if (expiredOldCode) { client.publish(topic('state', expiredOldCode), '', { qos: 1, retain: true }); expiredOldCode = null; }
+    await verifyCode();
     publishState();
     rollcall();
   });
@@ -251,6 +260,29 @@ function connect() {
     let m; try { m = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
     onCardMessage(m);
   });
+}
+// 他の端末で使用中（6時間以内に動いている）の番号と重なったら、別の番号に取り直す
+async function verifyCode() {
+  for (let tries = 0; tries < 5; tries++) {
+    if (!client || !client.connected) return;
+    const t = topic('state');
+    const inUse = await new Promise(res => {
+      const onMsg = (tp, pl) => {
+        if (tp !== t) return;
+        try { const m = JSON.parse(new TextDecoder().decode(pl)); if (m.gameId !== S.gameId && Date.now() - m.ts < TTL_MS) done(true); } catch {}
+      };
+      const done = v => { client.removeListener('message', onMsg); clearTimeout(timer); res(v); };
+      const timer = setTimeout(() => done(false), 1500);
+      client.on('message', onMsg);
+      client.subscribe(t, { qos: 1 });
+    });
+    client.unsubscribe(t);
+    // 使用中でない、またはすでにゲームが進んでいる場合はそのまま
+    if (!inUse || S.drawn.length || Object.keys(S.players).length) return;
+    client.unsubscribe(topic('card'));
+    S = freshState(newCode()); save(); render();
+    client.subscribe(topic('card'), { qos: 1 });
+  }
 }
 function publishState() {
   if (!client || !client.connected) return;
@@ -354,7 +386,7 @@ function resetSession() {
   }
   S = freshState(newCode());
   save(); render(); showBall(null);
-  if (client && client.connected) { client.subscribe(topic('card'), { qos: 1 }); publishState(); }
+  if (client && client.connected) { client.subscribe(topic('card'), { qos: 1 }); verifyCode().then(publishState); }
 }
 
 /* ---------- 通知 ---------- */
