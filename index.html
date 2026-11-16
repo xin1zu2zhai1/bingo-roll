@@ -71,6 +71,8 @@
   .badge.reach { background: var(--reach); color: #2b1500; }
   .badge.bingo { background: var(--bingo); color: #fff; }
   .badge.none { background: #ffffff14; color: var(--muted); }
+  .player .kick { padding: 2px 8px; background: transparent; color: var(--muted); font-size: 16px; }
+  .player .kick:hover { color: var(--bingo); }
   .player.is-bingo { box-shadow: inset 4px 0 0 var(--bingo); }
   .player.is-reach { box-shadow: inset 4px 0 0 var(--reach); }
   .summary { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
@@ -149,6 +151,8 @@ const CARD_PAGE_URL = 'https://xin1zu2zhai1.github.io/bingo-card/';
 // ロール側とカード側で必ず同じ値にしてください
 const APP_NS = 'bingo-web-v1-x7q2m';
 const BROKER_URL = new URLSearchParams(location.search).get('broker') || 'wss://broker.emqx.io:8084/mqtt';
+// 操作（抽選・参加など）がこの時間ないと、自動で新しい認証番号に切り替えて参加者をリセット
+const SESSION_TTL_HOURS = 6;
 /* ================================================ */
 
 const LETTERS = ['B', 'I', 'N', 'G', 'O'];
@@ -173,7 +177,10 @@ const STORE_KEY = 'bingoRollState';
 let S = load() || freshState(newCode());
 let soundOn = true, speechOn = false, rolling = false;
 
-function freshState(code) { return { code, gameId: rid(), drawn: [], players: {} }; }
+const TTL_MS = SESSION_TTL_HOURS * 3600 * 1000;
+function freshState(code) { return { code, gameId: rid(), drawn: [], players: {}, lastActive: Date.now() }; }
+const touch = () => { S.lastActive = Date.now(); };
+const isExpired = () => !S.lastActive || Date.now() - S.lastActive > TTL_MS;
 function load() { try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch { return null; } }
 function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch {} }
 const topic = (kind, code = S.code) => `${APP_NS}/${code}/${kind}`;
@@ -232,6 +239,7 @@ function connect() {
   client.on('connect', () => {
     setConn('on', '接続済み');
     client.subscribe(topic('card'), { qos: 1 });
+    if (expiredOldCode) { client.publish(topic('state', expiredOldCode), '', { qos: 1, retain: true }); expiredOldCode = null; }
     publishState();
     rollcall();
   });
@@ -250,6 +258,14 @@ function publishState() {
 }
 function rollcall() {
   if (client && client.connected) client.publish(topic('cmd'), JSON.stringify({ type: 'rollcall', gameId: S.gameId }), { qos: 0 });
+}
+function kick(id) {
+  const p = S.players[id]; if (!p) return;
+  if (!confirm(`${p.name} さんを参加者から外しますか？`)) return;
+  if (client && client.connected) client.publish(topic('cmd'), JSON.stringify({ type: 'kick', cardId: id }), { qos: 1 });
+  delete S.players[id];
+  Object.values(S.players).filter(x => x.bingoAt).sort((a, b) => a.bingoAt - b.bingoAt || a.bingoRank - b.bingoRank).forEach((x, i) => { x.bingoRank = i + 1; });
+  save(); render();
 }
 function setConn(cls, text) { $('connDot').className = 'dot ' + cls; $('connText').textContent = text; }
 
@@ -270,6 +286,7 @@ function onCardMessage(m) {
   if (m.gameId === S.gameId && validCard(m.nums)) {
     if (JSON.stringify(p.nums) !== JSON.stringify(m.nums)) { p.nums = m.nums; p.reach = 0; p.bingo = 0; p.bingoAt = null; p.bingoRank = null; }
   }
+  touch();
   if (isNew) toast('info', `${p.name} さんが参加しました`);
   const events = recompute(true);
   save(); render(); announce(events);
@@ -293,7 +310,7 @@ function roll() {
     if (elapsed < 1500) setTimeout(tick, delay);
     else {
       ball.classList.remove('spin'); void ball.offsetWidth; ball.classList.add('pop');
-      S.drawn.push(final);
+      S.drawn.push(final); touch();
       showBall(final);
       if (soundOn) chord([523, 659, 784], 0.25);
       if (speechOn) speak(final);
@@ -309,7 +326,7 @@ function undo() {
   if (rolling || !S.drawn.length) return;
   const last = S.drawn[S.drawn.length - 1];
   if (!confirm(`最後の数字 ${letterOf(last)}-${last} を取り消しますか？`)) return;
-  S.drawn.pop();
+  S.drawn.pop(); touch();
   recompute(false);
   publishState(); save(); render();
   const prev = S.drawn[S.drawn.length - 1];
@@ -317,8 +334,9 @@ function undo() {
 }
 function newGame() {
   if (rolling) return;
-  if (!confirm('新しいゲームを始めますか？\n（出た数字はリセットされ、参加者のカードは新しく配り直されます）')) return;
-  S.gameId = rid(); S.drawn = [];
+  if (!confirm('新しいゲームを始めますか？\n（出た数字はリセットされ、参加者のカードは新しく配り直されます。オフラインの参加者は一覧から外れます）')) return;
+  S.gameId = rid(); S.drawn = []; touch();
+  for (const [id, p] of Object.entries(S.players)) if (!p.online) delete S.players[id]; // オフラインの人は一覧から外す（戻ってきたら再参加）
   for (const p of Object.values(S.players)) { p.nums = null; p.reach = 0; p.bingo = 0; p.bingoAt = null; p.bingoRank = null; p.hits = 0; }
   save(); publishState(); rollcall(); render(); showBall(null);
   toast('info', '新しいゲームを開始しました');
@@ -326,6 +344,9 @@ function newGame() {
 function changeCode() {
   if (rolling) return;
   if (!confirm('認証番号を変更しますか？\n（参加者は新しい番号で接続し直す必要があります）')) return;
+  resetSession();
+}
+function resetSession() {
   const old = S.code;
   if (client && client.connected) {
     client.publish(topic('state', old), '', { qos: 1, retain: true }); // 古い番号の保存データを削除
@@ -414,18 +435,21 @@ function render() {
   $('undoBtn').disabled = !S.drawn.length;
 
   const ps = Object.values(S.players);
+  const ids = new Map(Object.entries(S.players).map(([id, p]) => [p, id]));
   ps.sort((a, b) => (a.bingoRank || 999) - (b.bingoRank || 999) || (b.reach || 0) - (a.reach || 0) || (b.hits || 0) - (a.hits || 0) || a.joinedAt - b.joinedAt);
   $('sumAll').textContent = ps.length;
   $('sumReach').textContent = ps.filter(p => !p.bingo && p.reach).length;
   $('sumBingo').textContent = ps.filter(p => p.bingo).length;
   $('players').innerHTML = ps.length ? ps.map(p => {
+    const id = ids.get(p);
     let badge = '<span class="badge none">—</span>', cls = '';
     if (!p.nums) badge = '<span class="badge none">カード待ち</span>';
     else if (p.bingo) { badge = `<span class="badge bingo">BINGO ${p.bingoRank}位</span>`; cls = 'is-bingo'; }
     else if (p.reach) { badge = `<span class="badge reach">リーチ${p.reach > 1 ? '×' + p.reach : ''}</span>`; cls = 'is-reach'; }
     const sub = p.bingo ? `${p.bingoAt}球目でビンゴ` : p.nums ? `${p.hits || 0}個 当たり` : '';
     return `<div class="player ${cls}"><span class="dot ${p.online ? 'on' : ''}"></span>
-      <div class="name">${esc(p.name)}<div class="sub">${sub}</div></div>${badge}</div>`;
+      <div class="name">${esc(p.name)}<div class="sub">${sub}</div></div>${badge}
+      <button class="kick" data-id="${esc(id)}" title="参加者から外す">×</button></div>`;
   }).join('') : '<div class="empty">まだ参加者がいません。カードページで認証番号を入力してもらいましょう。</div>';
 
   const ji = $('joinInfo');
@@ -448,9 +472,19 @@ $('soundBtn').onclick = e => { soundOn = !soundOn; e.currentTarget.classList.tog
 $('speechBtn').onclick = e => { speechOn = !speechOn; e.currentTarget.classList.toggle('on', speechOn); };
 document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target === document.body) { e.preventDefault(); roll(); } });
 
+$('players').addEventListener('click', e => { const b = e.target.closest('.kick'); if (b) kick(b.dataset.id); });
 buildBoard();
+// 長時間放置されていたら、以前の参加者が残らないよう新しい番号で始める
+let expiredOldCode = null;
+if (isExpired()) { expiredOldCode = S.code; S = freshState(newCode()); }
 for (const p of Object.values(S.players)) p.online = false;
 save(); render();
+// 開いたまま放置された場合も定期的にチェック。状態は10分ごとに再送して「生きている」ことを示す
+setInterval(() => {
+  if (rolling) return;
+  if (isExpired()) { resetSession(); toast('info', '長時間操作がなかったため、新しい認証番号に切り替えました'); }
+  else publishState();
+}, 10 * 60 * 1000);
 showBall(S.drawn[S.drawn.length - 1] || null);
 if (window.mqtt) connect(); else setConn('', 'ライブラリの読み込みに失敗しました');
 </script>
