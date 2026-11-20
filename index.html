@@ -150,7 +150,17 @@
 const CARD_PAGE_URL = 'https://xin1zu2zhai1.github.io/bingo-card/';
 // ロール側とカード側で必ず同じ値にしてください
 const APP_NS = 'bingo-web-v1-x7q2m';
-const BROKER_URL = new URLSearchParams(location.search).get('broker') || 'wss://broker.emqx.io:8084/mqtt';
+// 通信に使う無料の公開MQTTサーバー。全部に同時接続し、どれか1つでも共通でつながれば動きます
+// （ネットワークによってはポートが塞がれていたり、サーバーが落ちていたりするため複数使います）
+const BROKERS = new URLSearchParams(location.search).get('broker')
+  ? new URLSearchParams(location.search).get('broker').split(',').map(url => ({ url }))
+  : [
+      { url: 'wss://mqtt.eclipseprojects.io:443/mqtt' },
+      { url: 'wss://public.cloud.shiftr.io:443', username: 'public', password: 'public' },
+      { url: 'wss://broker.emqx.io:8084/mqtt' },
+      { url: 'wss://broker.hivemq.com:8884/mqtt' },
+      { url: 'wss://test.mosquitto.org:8081/mqtt' },
+    ];
 // 操作（抽選・参加など）がこの時間ないと、自動で新しい認証番号に切り替えて参加者をリセット
 const SESSION_TTL_HOURS = 6;
 /* ================================================ */
@@ -237,29 +247,62 @@ function recompute(notify) {
   return events;
 }
 
-/* ---------- MQTT ---------- */
-let client = null;
-function connect() {
-  setConn('wait', 'サーバーに接続中…');
-  client = mqtt.connect(BROKER_URL, {
-    clientId: 'roll_' + rid(12), clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 10000,
+
+/* ---------- 複数サーバーへの同時接続 ---------- */
+function createHub(prefix, will) {
+  const subs = new Set(), L = { message: new Set(), connect: new Set(), status: new Set() };
+  const emit = (ev, ...a) => L[ev].forEach(f => { try { f(...a); } catch (e) { console.error(e); } });
+  const clients = BROKERS.map((b, i) => {
+    const c = mqtt.connect(b.url, {
+      clientId: prefix + rid(12), clean: true, keepalive: 30, reconnectPeriod: 4000, connectTimeout: 10000,
+      username: b.username, password: b.password, will,
+    });
+    c.on('connect', () => { if (subs.size) c.subscribe([...subs], { qos: 1 }); emit('status'); emit('connect', i); });
+    c.on('close', () => emit('status'));
+    c.on('error', e => console.warn(b.url, e && e.message));
+    c.on('message', (t, p) => emit('message', t, new TextDecoder().decode(p), i));
+    return c;
   });
-  client.on('connect', async () => {
-    setConn('on', '接続済み');
-    client.subscribe(topic('card'), { qos: 1 });
-    if (expiredOldCode) { client.publish(topic('state', expiredOldCode), '', { qos: 1, retain: true }); expiredOldCode = null; }
-    await verifyCode();
+  return {
+    get connected() { return clients.some(c => c.connected); },
+    get count() { return clients.filter(c => c.connected).length; },
+    get detail() { return BROKERS.map((b, i) => (clients[i].connected ? '● ' : '× ') + b.url.replace(/^wss?:\/\//, '')).join('\n'); },
+    on(ev, f) { L[ev].add(f); }, off(ev, f) { L[ev].delete(f); },
+    subscribe(t) { subs.add(t); clients.forEach(c => c.connected && c.subscribe(t, { qos: 1 })); },
+    unsubscribe(t) { subs.delete(t); clients.forEach(c => c.connected && c.unsubscribe(t)); },
+    publish(t, payload, opts, only) { clients.forEach((c, i) => { if (c.connected && (only == null || only === i)) c.publish(t, payload, opts); }); },
+    end(force) { clients.forEach(c => c.end(force)); },
+  };
+}
+
+/* ---------- MQTT ---------- */
+let client = null, connStart = 0, verifying = null;
+function connect() {
+  connStart = Date.now();
+  client = createHub('roll_');
+  client.subscribe(topic('card'));
+  client.on('status', updateConn);
+  client.on('connect', async i => {
+    if (expiredOldCode) client.publish(topic('state', expiredOldCode), '', { qos: 1, retain: true }, i); // 古い番号の保存データを削除
+    verifying = verifying || verifyCode();
+    await verifying;
     publishState();
     rollcall();
   });
-  client.on('reconnect', () => setConn('wait', '再接続中…'));
-  client.on('offline', () => setConn('', 'オフライン'));
-  client.on('error', e => { console.warn(e); setConn('', '接続エラー'); });
-  client.on('message', (t, payload) => {
+  client.on('message', (t, text, i) => {
     if (t !== topic('card')) return;
-    let m; try { m = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
-    onCardMessage(m);
+    let m; try { m = JSON.parse(text); } catch { return; }
+    onCardMessage(m, i);
   });
+  updateConn();
+  setTimeout(updateConn, 15000);
+}
+function updateConn() {
+  if (!client) return;
+  $('connText').title = client.detail;
+  if (client.count) setConn('on', '接続済み');
+  else if (Date.now() - connStart > 14000) setConn('', '通信サーバーにつながりません。ネットワークを確認してください');
+  else setConn('wait', 'サーバーに接続中…');
 }
 // 他の端末で使用中（6時間以内に動いている）の番号と重なったら、別の番号に取り直す
 async function verifyCode() {
@@ -267,14 +310,14 @@ async function verifyCode() {
     if (!client || !client.connected) return;
     const t = topic('state');
     const inUse = await new Promise(res => {
-      const onMsg = (tp, pl) => {
-        if (tp !== t) return;
-        try { const m = JSON.parse(new TextDecoder().decode(pl)); if (m.gameId !== S.gameId && Date.now() - m.ts < TTL_MS) done(true); } catch {}
+      const onMsg = (tp, text) => {
+        if (tp !== t || !text) return;
+        try { const m = JSON.parse(text); if (m.gameId !== S.gameId && Date.now() - m.ts < TTL_MS) done(true); } catch {}
       };
-      const done = v => { client.removeListener('message', onMsg); clearTimeout(timer); res(v); };
+      const done = v => { client.off('message', onMsg); clearTimeout(timer); res(v); };
       const timer = setTimeout(() => done(false), 1500);
       client.on('message', onMsg);
-      client.subscribe(t, { qos: 1 });
+      client.subscribe(t);
     });
     client.unsubscribe(t);
     // 使用中でない、またはすでにゲームが進んでいる場合はそのまま
@@ -301,17 +344,20 @@ function kick(id) {
 }
 function setConn(cls, text) { $('connDot').className = 'dot ' + cls; $('connText').textContent = text; }
 
-function onCardMessage(m) {
+function onCardMessage(m, via) {
   if (!m || typeof m.cardId !== 'string' || m.cardId.length > 40) return;
   const id = m.cardId;
   if (m.type === 'bye') {
-    if (S.players[id]) { S.players[id].online = false; save(); render(); }
+    // サーバーごとに接続を管理し、全部切れたらオフライン
+    const q = S.players[id];
+    if (q) { q.links = (q.links || []).filter(x => x !== via); q.online = q.links.length > 0; save(); render(); }
     return;
   }
   if (m.type !== 'hello' && m.type !== 'update') return;
   const isNew = !S.players[id];
   const p = S.players[id] || (S.players[id] = { joinedAt: Date.now() });
   p.name = String(m.name || '名無し').slice(0, 20);
+  p.links = [...new Set([...(p.links || []), via])];
   p.online = true;
   p.lastSeen = Date.now();
   // 現在のゲームのカードだけ受け付ける（カードの数字はロール側で検証して判定）
@@ -509,7 +555,7 @@ buildBoard();
 // 長時間放置されていたら、以前の参加者が残らないよう新しい番号で始める
 let expiredOldCode = null;
 if (isExpired()) { expiredOldCode = S.code; S = freshState(newCode()); }
-for (const p of Object.values(S.players)) p.online = false;
+for (const p of Object.values(S.players)) { p.online = false; p.links = []; }
 save(); render();
 // 開いたまま放置された場合も定期的にチェック。状態は10分ごとに再送して「生きている」ことを示す
 setInterval(() => {
